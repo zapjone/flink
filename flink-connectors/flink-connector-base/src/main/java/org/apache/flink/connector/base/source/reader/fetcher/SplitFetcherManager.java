@@ -18,6 +18,7 @@
 
 package org.apache.flink.connector.base.source.reader.fetcher;
 
+import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.connector.source.SourceSplit;
 import org.apache.flink.connector.base.source.reader.RecordsWithSplitIds;
 import org.apache.flink.connector.base.source.reader.SourceReaderBase;
@@ -133,7 +134,13 @@ public abstract class SplitFetcherManager<E, SplitT extends SourceSplit> {
 			elementsQueue,
 			splitReader,
 			errorHandler,
-			() -> fetchers.remove(fetcherId));
+			() -> {
+				fetchers.remove(fetcherId);
+				// We need this to synchronize status of fetchers to concurrent partners as
+				// ConcurrentHashMap's aggregate status methods including size, isEmpty, and
+				// containsValue are not designed for program control.
+				elementsQueue.notifyAvailable();
+			});
 		fetchers.put(fetcherId, splitFetcher);
 		return splitFetcher;
 	}
@@ -178,5 +185,12 @@ public abstract class SplitFetcherManager<E, SplitT extends SourceSplit> {
 			throw new RuntimeException("One or more fetchers have encountered exception",
 				uncaughtFetcherException.get());
 		}
+	}
+
+	// -----------------------
+
+	@VisibleForTesting
+	public int getNumAliveFetchers() {
+		return fetchers.size();
 	}
 }

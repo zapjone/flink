@@ -222,7 +222,7 @@ public class StreamExecutionEnvironment {
 			final Configuration configuration,
 			final ClassLoader userClassloader) {
 		this.executorServiceLoader = checkNotNull(executorServiceLoader);
-		this.configuration = checkNotNull(configuration);
+		this.configuration = new Configuration(checkNotNull(configuration));
 		this.userClassloader = userClassloader == null ? getClass().getClassLoader() : userClassloader;
 
 		// the configuration of a job or an operator can be specified at the following places:
@@ -281,6 +281,26 @@ public class StreamExecutionEnvironment {
 	 */
 	public StreamExecutionEnvironment setParallelism(int parallelism) {
 		config.setParallelism(parallelism);
+		return this;
+	}
+
+	/**
+	 * Sets the runtime execution mode for the application (see {@link RuntimeExecutionMode}).
+	 * This is equivalent to setting the {@code execution.runtime-mode} in your application's
+	 * configuration file.
+	 *
+	 * <p>We recommend users to NOT use this method but set the {@code execution.runtime-mode}
+	 * using the command-line when submitting the application. Keeping the application code
+	 * configuration-free allows for more flexibility as the same application will be able to
+	 * be executed in any execution mode.
+	 *
+	 * @param executionMode the desired execution mode.
+	 * @return The execution environment of your application.
+	 */
+	@PublicEvolving
+	public StreamExecutionEnvironment setRuntimeMode(final RuntimeExecutionMode executionMode) {
+		checkNotNull(executionMode);
+		configuration.set(ExecutionOptions.RUNTIME_MODE, executionMode);
 		return this;
 	}
 
@@ -818,6 +838,9 @@ public class StreamExecutionEnvironment {
 		);
 		configuration.getOptional(ExecutionOptions.USE_BATCH_STATE_BACKEND).ifPresent(
 			sortInputs -> this.getConfiguration().set(ExecutionOptions.USE_BATCH_STATE_BACKEND, sortInputs)
+		);
+		configuration.getOptional(PipelineOptions.NAME).ifPresent(
+			jobName -> this.getConfiguration().set(PipelineOptions.NAME, jobName)
 		);
 		config.configure(configuration, classLoader);
 		checkpointCfg.configure(configuration);
@@ -1778,7 +1801,7 @@ public class StreamExecutionEnvironment {
 	 * @throws Exception which occurs during job execution.
 	 */
 	public JobExecutionResult execute() throws Exception {
-		return execute(DEFAULT_JOB_NAME);
+		return execute(getJobName());
 	}
 
 	/**
@@ -1871,7 +1894,7 @@ public class StreamExecutionEnvironment {
 	 */
 	@PublicEvolving
 	public final JobClient executeAsync() throws Exception {
-		return executeAsync(DEFAULT_JOB_NAME);
+		return executeAsync(getJobName());
 	}
 
 	/**
@@ -1938,7 +1961,7 @@ public class StreamExecutionEnvironment {
 	 */
 	@Internal
 	public StreamGraph getStreamGraph() {
-		return getStreamGraph(DEFAULT_JOB_NAME);
+		return getStreamGraph(getJobName());
 	}
 
 	/**
@@ -1998,7 +2021,7 @@ public class StreamExecutionEnvironment {
 	 * @return The execution plan of the program, as a JSON String.
 	 */
 	public String getExecutionPlan() {
-		return getStreamGraph(DEFAULT_JOB_NAME, false).getStreamingPlanAsJSON();
+		return getStreamGraph(getJobName(), false).getStreamingPlanAsJSON();
 	}
 
 	/**
@@ -2329,5 +2352,9 @@ public class StreamExecutionEnvironment {
 			}
 		}
 		return (T) resolvedTypeInfo;
+	}
+
+	private String getJobName() {
+		return configuration.getString(PipelineOptions.NAME, DEFAULT_JOB_NAME);
 	}
 }

@@ -58,7 +58,6 @@ import org.apache.flink.runtime.state.memory.MemoryBackendCheckpointStorageAcces
 import org.apache.flink.runtime.state.memory.MemoryStateBackend;
 import org.apache.flink.runtime.state.memory.NonPersistentMetadataCheckpointStorageLocation;
 import org.apache.flink.runtime.state.testutils.TestCompletedCheckpointStorageLocation;
-import org.apache.flink.runtime.testutils.RecoverableCompletedCheckpointStore;
 import org.apache.flink.util.ExceptionUtils;
 import org.apache.flink.util.TestLogger;
 
@@ -2034,7 +2033,7 @@ public class CheckpointCoordinatorTest extends TestLogger {
 		ExecutionVertex[] arrayExecutionVertices =
 			allExecutionVertices.toArray(new ExecutionVertex[allExecutionVertices.size()]);
 
-		RecoverableCompletedCheckpointStore store = new RecoverableCompletedCheckpointStore(10);
+		EmbeddedCompletedCheckpointStore store = new EmbeddedCompletedCheckpointStore(10);
 
 		final List<SharedStateRegistry> createdSharedStateRegistries = new ArrayList<>(2);
 
@@ -2621,7 +2620,10 @@ public class CheckpointCoordinatorTest extends TestLogger {
 		return new CheckpointCoordinatorBuilder()
 			.setJobId(jobId)
 			.setTasks(new ExecutionVertex[]{ vertex1, vertex2 })
-			.setCheckpointCoordinatorConfiguration(CheckpointCoordinatorConfiguration.builder().setMaxConcurrentCheckpoints(Integer.MAX_VALUE).build())
+			.setCheckpointCoordinatorConfiguration(
+				CheckpointCoordinatorConfiguration.builder()
+					.setAlignmentTimeout(Long.MAX_VALUE)
+					.setMaxConcurrentCheckpoints(Integer.MAX_VALUE).build())
 			.setTimer(manuallyTriggeredScheduledExecutor)
 			.build();
 	}

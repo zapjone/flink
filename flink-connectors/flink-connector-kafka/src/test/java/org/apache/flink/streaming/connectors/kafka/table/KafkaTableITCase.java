@@ -19,6 +19,7 @@
 package org.apache.flink.streaming.connectors.kafka.table;
 
 import org.apache.flink.api.common.restartstrategy.RestartStrategies;
+import org.apache.flink.core.execution.JobClient;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.sink.SinkFunction;
@@ -26,6 +27,7 @@ import org.apache.flink.streaming.connectors.kafka.KafkaTestBase;
 import org.apache.flink.streaming.connectors.kafka.KafkaTestBaseWithFlink;
 import org.apache.flink.streaming.connectors.kafka.partitioner.FlinkKafkaPartitioner;
 import org.apache.flink.table.api.EnvironmentSettings;
+import org.apache.flink.table.api.TableResult;
 import org.apache.flink.table.api.bridge.java.StreamTableEnvironment;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.descriptors.KafkaValidator;
@@ -50,6 +52,7 @@ import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
 import static org.apache.flink.streaming.connectors.kafka.table.KafkaTableTestUtils.collectRows;
+import static org.apache.flink.streaming.connectors.kafka.table.KafkaTableTestUtils.readLines;
 import static org.apache.flink.table.utils.TableTestMatchers.deepEqualTo;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertThat;
@@ -519,6 +522,150 @@ public class KafkaTableITCase extends KafkaTestBaseWithFlink {
 	}
 
 	@Test
+	public void testKafkaTemporalJoinChangelog() throws Exception {
+		if (isLegacyConnector) {
+			return;
+		}
+
+		//Set the session time zone to UTC, because the next `METADATA FROM 'value.source.timestamp'` DDL
+		// will use the session time zone when convert the changelog time from milliseconds to timestamp
+		tEnv.getConfig().getConfiguration().setString("table.local-time-zone", "UTC");
+
+		// we always use a different topic name for each parameterized topic,
+		// in order to make sure the topic can be created.
+		final String orderTopic = "temporal_join_topic_order_" + format;
+		createTestTopic(orderTopic, 1, 1);
+
+		final String productTopic = "temporal_join_topic_product_" + format;
+		createTestTopic(productTopic, 1, 1);
+
+		// ---------- Produce an event time stream into Kafka -------------------
+		String groupId = standardProps.getProperty("group.id");
+		String bootstraps = standardProps.getProperty("bootstrap.servers");
+
+		// create order table and set initial values
+		final String orderTableDDL = String.format(
+				"CREATE TABLE ordersTable (\n" +
+						"  order_id STRING,\n" +
+						"  product_id STRING,\n" +
+						"  order_time TIMESTAMP(3),\n" +
+						"  quantity INT,\n" +
+						"  purchaser STRING,\n" +
+						"  WATERMARK FOR order_time AS order_time - INTERVAL '1' SECOND\n" +
+						") WITH (\n" +
+						"  'connector' = 'kafka',\n" +
+						"  'topic' = '%s',\n" +
+						"  'scan.startup.mode' = 'earliest-offset',\n" +
+						"  'properties.bootstrap.servers' = '%s',\n" +
+						"  'properties.group.id' = '%s',\n" +
+						"  'format' = '%s'\n" +
+						")",
+				orderTopic,
+				bootstraps,
+				groupId,
+				format);
+		tEnv.executeSql(orderTableDDL);
+		String orderInitialValues = "INSERT INTO ordersTable\n"
+				+ "VALUES\n"
+				+ "('o_001', 'p_001', TIMESTAMP '2020-10-01 00:01:00', 1, 'Alice'),"
+				+ "('o_002', 'p_002', TIMESTAMP '2020-10-01 00:02:00', 1, 'Bob'),"
+				+ "('o_003', 'p_001', TIMESTAMP '2020-10-01 12:00:00', 2, 'Tom'),"
+				+ "('o_004', 'p_002', TIMESTAMP '2020-10-01 12:00:00', 2, 'King'),"
+				+ "('o_005', 'p_001', TIMESTAMP '2020-10-01 18:00:00', 10, 'Leonard'),"
+				+ "('o_006', 'p_002', TIMESTAMP '2020-10-01 18:00:00', 10, 'Leonard'),"
+				+ "('o_007', 'p_002', TIMESTAMP '2020-10-01 18:00:01', 10, 'Robinson')"; // used to advance watermark
+		tEnv.executeSql(orderInitialValues).await();
+
+		// create product table and set initial values
+		final String productTableDDL = String.format(
+				"CREATE TABLE productChangelogTable (\n" +
+						"  product_id STRING,\n" +
+						"  product_name STRING,\n" +
+						"  product_price DECIMAL(10, 4),\n" +
+						"  update_time TIMESTAMP(3) METADATA FROM 'value.source.timestamp' VIRTUAL,\n" +
+						"  PRIMARY KEY(product_id) NOT ENFORCED,\n" +
+						"  WATERMARK FOR update_time AS update_time - INTERVAL '1' SECOND\n" +
+						") WITH (\n" +
+						"  'connector' = 'kafka',\n" +
+						"  'topic' = '%s',\n" +
+						"  'scan.startup.mode' = 'earliest-offset',\n" +
+						"  'properties.bootstrap.servers' = '%s',\n" +
+						"  'properties.group.id' = '%s',\n" +
+						"  'value.format' = 'debezium-json'\n" +
+						")",
+				productTopic,
+				bootstraps,
+				groupId);
+		tEnv.executeSql(productTableDDL);
+
+		// use raw format to initial the changelog data
+		initialProductChangelog(productTopic, bootstraps);
+
+		// ---------- query temporal join result from Kafka -------------------
+		final List<String> result = collectRows(
+				tEnv.sqlQuery("SELECT" +
+						"  order_id," +
+						"  order_time," +
+						"  P.product_id," +
+						"  P.update_time as product_update_time," +
+						"  product_price," +
+						"  purchaser," +
+						"  product_name," +
+						"  quantity," +
+						"  quantity * product_price AS order_amount " +
+						"FROM ordersTable AS O " +
+						"LEFT JOIN productChangelogTable FOR SYSTEM_TIME AS OF O.order_time AS P " +
+						"ON O.product_id = P.product_id"),
+				6)
+				.stream()
+				.map(row -> row.toString())
+				.sorted()
+				.collect(Collectors.toList());
+
+		final List<String> expected = Arrays.asList(
+				"o_001,2020-10-01T00:01,p_001,1970-01-01T00:00,11.1100,Alice,scooter,1,11.1100",
+				"o_002,2020-10-01T00:02,p_002,1970-01-01T00:00,23.1100,Bob,basketball,1,23.1100",
+				"o_003,2020-10-01T12:00,p_001,2020-10-01T12:00,12.9900,Tom,scooter,2,25.9800",
+				"o_004,2020-10-01T12:00,p_002,2020-10-01T12:00,19.9900,King,basketball,2,39.9800",
+				"o_005,2020-10-01T18:00,p_001,2020-10-01T18:00,11.9900,Leonard,scooter,10,119.9000",
+				"o_006,2020-10-01T18:00,null,null,null,Leonard,null,10,null"
+		);
+
+		assertEquals(expected, result);
+
+		// ------------- cleanup -------------------
+
+		deleteTestTopic(orderTopic);
+		deleteTestTopic(productTopic);
+	}
+
+	private void initialProductChangelog(String topic, String bootstraps) throws Exception {
+		String productChangelogDDL = String.format(
+				"CREATE TABLE productChangelog (\n" +
+						"  changelog STRING" +
+						") WITH (\n" +
+						"  'connector' = 'kafka',\n" +
+						"  'topic' = '%s',\n" +
+						"  'scan.startup.mode' = 'earliest-offset',\n" +
+						"  'properties.bootstrap.servers' = '%s',\n" +
+						"  'format' = 'raw'\n" +
+						")",
+				topic,
+				bootstraps);
+		tEnv.executeSql(productChangelogDDL);
+		String[] allChangelog = readLines("product_changelog.txt").toArray(new String[0]);
+
+		StringBuilder insertSqlSb = new StringBuilder();
+		insertSqlSb.append("INSERT INTO productChangelog VALUES ");
+		for (String log: allChangelog) {
+			insertSqlSb.append("('" + log + "'),");
+		}
+		// trim the last comma
+		String insertSql = insertSqlSb.substring(0, insertSqlSb.toString().length() - 1);
+		tEnv.executeSql(insertSql).await();
+	}
+
+	@Test
 	public void testPerPartitionWatermarkKafka() throws Exception {
 		if (isLegacyConnector) {
 			return;
@@ -555,6 +702,7 @@ public class KafkaTableITCase extends KafkaTestBaseWithFlink {
 
 		tEnv.executeSql(createTable);
 
+		// make every partition have more than one record
 		String initialValues = "INSERT INTO kafka\n"
 				+ "VALUES\n"
 				+ " (0, 'partition-0-name-0', TIMESTAMP '2020-03-08 13:12:11.123'),\n"
@@ -564,10 +712,18 @@ public class KafkaTableITCase extends KafkaTestBaseWithFlink {
 				+ " (1, 'partition-1-name-1', TIMESTAMP '2020-03-09 15:13:11.133'),\n"
 				+ " (1, 'partition-1-name-2', TIMESTAMP '2020-03-09 16:13:11.143'),\n"
 				+ " (2, 'partition-2-name-0', TIMESTAMP '2020-03-10 13:12:14.123'),\n"
-				+ " (3, 'partition-3-name-0', TIMESTAMP '2020-03-11 17:12:11.123')\n";
+				+ " (2, 'partition-2-name-1', TIMESTAMP '2020-03-10 14:12:14.123'),\n"
+				+ " (2, 'partition-2-name-2', TIMESTAMP '2020-03-10 14:13:14.123'),\n"
+				+ " (2, 'partition-2-name-3', TIMESTAMP '2020-03-10 14:14:14.123'),\n"
+				+ " (2, 'partition-2-name-4', TIMESTAMP '2020-03-10 14:15:14.123'),\n"
+				+ " (2, 'partition-2-name-5', TIMESTAMP '2020-03-10 14:16:14.123'),\n"
+				+ " (3, 'partition-3-name-0', TIMESTAMP '2020-03-11 17:12:11.123'),\n"
+				+ " (3, 'partition-3-name-1', TIMESTAMP '2020-03-11 18:12:11.123')";
 		tEnv.executeSql(initialValues).await();
 
 		// ---------- Consume stream from Kafka -------------------
+
+		env.setParallelism(1);
 		String createSink =
 				"CREATE TABLE MySink(\n"
 						+ "  id INT,\n"
@@ -579,7 +735,7 @@ public class KafkaTableITCase extends KafkaTestBaseWithFlink {
 						+ "  'sink.drop-late-event' = 'true'\n"
 						+ ")";
 		tEnv.executeSql(createSink);
-		tEnv.executeSql("INSERT INTO MySink SELECT * FROM kafka");
+		TableResult tableResult = tEnv.executeSql("INSERT INTO MySink SELECT * FROM kafka");
 		final List<String> expected = Arrays.asList(
 			"0,partition-0-name-0,2020-03-08T13:12:11.123",
 			"0,partition-0-name-1,2020-03-08T14:12:12.223",
@@ -588,15 +744,21 @@ public class KafkaTableITCase extends KafkaTestBaseWithFlink {
 			"1,partition-1-name-1,2020-03-09T15:13:11.133",
 			"1,partition-1-name-2,2020-03-09T16:13:11.143",
 			"2,partition-2-name-0,2020-03-10T13:12:14.123",
-			"3,partition-3-name-0,2020-03-11T17:12:11.123"
+			"2,partition-2-name-1,2020-03-10T14:12:14.123",
+			"2,partition-2-name-2,2020-03-10T14:13:14.123",
+			"2,partition-2-name-3,2020-03-10T14:14:14.123",
+			"2,partition-2-name-4,2020-03-10T14:15:14.123",
+			"2,partition-2-name-5,2020-03-10T14:16:14.123",
+			"3,partition-3-name-0,2020-03-11T17:12:11.123",
+			"3,partition-3-name-1,2020-03-11T18:12:11.123"
 		);
 		KafkaTableTestUtils.waitingExpectedResults("MySink", expected, Duration.ofSeconds(5));
 
 		// ------------- cleanup -------------------
 
+		tableResult.getJobClient().ifPresent(JobClient::cancel);
 		deleteTestTopic(topic);
 	}
-
 
 
 	// --------------------------------------------------------------------------------------------

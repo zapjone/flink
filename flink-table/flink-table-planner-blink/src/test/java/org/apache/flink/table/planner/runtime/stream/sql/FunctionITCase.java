@@ -22,18 +22,23 @@ import org.apache.flink.api.common.ExecutionConfig;
 import org.apache.flink.api.java.typeutils.runtime.kryo.KryoSerializer;
 import org.apache.flink.table.annotation.DataTypeHint;
 import org.apache.flink.table.annotation.FunctionHint;
+import org.apache.flink.table.annotation.HintFlag;
 import org.apache.flink.table.annotation.InputGroup;
 import org.apache.flink.table.api.DataTypes;
 import org.apache.flink.table.api.Table;
 import org.apache.flink.table.api.ValidationException;
+import org.apache.flink.table.api.dataview.MapView;
 import org.apache.flink.table.catalog.Catalog;
 import org.apache.flink.table.catalog.CatalogFunction;
 import org.apache.flink.table.catalog.DataTypeFactory;
 import org.apache.flink.table.catalog.ObjectPath;
+import org.apache.flink.table.connector.source.LookupTableSource;
+import org.apache.flink.table.data.StringData;
 import org.apache.flink.table.functions.AggregateFunction;
 import org.apache.flink.table.functions.ScalarFunction;
 import org.apache.flink.table.functions.TableFunction;
 import org.apache.flink.table.planner.factories.utils.TestCollectionTableFactory;
+import org.apache.flink.table.planner.functions.BuiltInFunctionTestBase;
 import org.apache.flink.table.planner.runtime.utils.StreamingTestBase;
 import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.types.inference.TypeInference;
@@ -52,7 +57,10 @@ import java.time.LocalDateTime;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.ExecutionException;
+import java.util.stream.Collectors;
 
 import static org.hamcrest.CoreMatchers.containsString;
 import static org.hamcrest.CoreMatchers.equalTo;
@@ -66,7 +74,10 @@ import static org.junit.Assert.fail;
 import static org.junit.internal.matchers.ThrowableMessageMatcher.hasMessage;
 
 /**
- * Tests for catalog and system in stream table environment.
+ * Tests for catalog and system functions in a table environment.
+ *
+ * <p>Note: This class is meant for testing the core function support. Use {@link BuiltInFunctionTestBase}
+ * for testing individual function implementations.
  */
 public class FunctionITCase extends StreamingTestBase {
 
@@ -739,7 +750,7 @@ public class FunctionITCase extends StreamingTestBase {
 				e,
 				hasMessage(
 					equalTo(
-						"Could not find an implementation method 'eval' in class '" + CustomScalarFunction.class +
+						"Could not find an implementation method 'eval' in class '" + CustomScalarFunction.class.getName() +
 						"' for function 'CustomScalarFunction' that matches the following signature:\n" +
 						"java.lang.String eval(java.lang.String)")));
 		}
@@ -899,8 +910,8 @@ public class FunctionITCase extends StreamingTestBase {
 		);
 
 		final List<Row> sinkData = Arrays.asList(
-			Row.of("Jonathan"),
-			Row.of("Alice")
+			Row.of("Jonathan", "Alice=(Alice, 5), Bob=(Bob, 3), Jonathan=(Jonathan, 8)"),
+			Row.of("Alice", "Alice=(Alice, 5), Bob=(Bob, 3)")
 		);
 
 		TestCollectionTableFactory.reset();
@@ -910,16 +921,70 @@ public class FunctionITCase extends StreamingTestBase {
 			"CREATE TABLE SourceTable(ts TIMESTAMP(3), s STRING, WATERMARK FOR ts AS ts - INTERVAL '1' SECOND) " +
 				"WITH ('connector' = 'COLLECTION')");
 		tEnv().executeSql(
-			"CREATE TABLE SinkTable(s STRING) WITH ('connector' = 'COLLECTION')");
+			"CREATE TABLE SinkTable(s1 STRING, s2 STRING) WITH ('connector' = 'COLLECTION')");
 
-		tEnv().executeSql(
-			"CREATE FUNCTION LongestStringAggregateFunction AS '" + LongestStringAggregateFunction.class.getName() + "'");
+		tEnv().createTemporarySystemFunction("LongestStringAggregateFunction", LongestStringAggregateFunction.class);
+		tEnv().createTemporarySystemFunction("RawMapViewAggregateFunction", RawMapViewAggregateFunction.class);
 
 		tEnv().executeSql(
 			"INSERT INTO SinkTable " +
-			"SELECT LongestStringAggregateFunction(s) " +
+			"SELECT LongestStringAggregateFunction(s), RawMapViewAggregateFunction(s) " +
 			"FROM SourceTable " +
 			"GROUP BY TUMBLE(ts, INTERVAL '1' SECOND)").await();
+
+		assertThat(TestCollectionTableFactory.getResult(), equalTo(sinkData));
+	}
+
+	@Test
+	public void testLookupTableFunction() throws ExecutionException, InterruptedException {
+		final List<Row> sourceData = Arrays.asList(
+			Row.of("Bob"),
+			Row.of("Alice")
+		);
+
+		final List<Row> sinkData = Arrays.asList(
+			Row.of("Bob", new byte[0]),
+			Row.of("Bob", new byte[]{66, 111, 98}),
+			Row.of("Alice", new byte[0]),
+			Row.of("Alice", new byte[]{65, 108, 105, 99, 101})
+		);
+
+		TestCollectionTableFactory.reset();
+		TestCollectionTableFactory.initData(sourceData);
+
+		tEnv()
+			.executeSql(
+				"CREATE TABLE SourceTable1("
+					+ "  s STRING, "
+					+ "  proctime AS PROCTIME()"
+					+ ")"
+					+ "WITH ("
+					+ "  'connector' = 'COLLECTION'"
+					+ ")");
+
+		tEnv()
+			.executeSql(
+				"CREATE TABLE SourceTable2("
+					+ "  s STRING,"
+					+ "  b BYTES"
+					+ ")"
+					+ "WITH ("
+					+ "  'connector' = 'values',"
+					+ "  'lookup-function-class' = '" + LookupTableFunction.class.getName() + "'"
+					+ ")");
+
+		tEnv()
+			.executeSql(
+				"CREATE TABLE SinkTable(s STRING, b BYTES) WITH ('connector' = 'COLLECTION')");
+
+		tEnv()
+			.executeSql(
+				"INSERT INTO SinkTable "
+					+ "SELECT SourceTable1.s, SourceTable2.b "
+					+ "FROM SourceTable1 "
+					+ "JOIN SourceTable2 FOR SYSTEM_TIME AS OF SourceTable1.proctime"
+					+ "  ON SourceTable1.s = SourceTable2.s")
+			.await();
 
 		assertThat(TestCollectionTableFactory.getResult(), equalTo(sinkData));
 	}
@@ -1229,6 +1294,70 @@ public class FunctionITCase extends StreamingTestBase {
 		@Override
 		public String getValue(Row acc) {
 			return (String) acc.getField(0);
+		}
+	}
+
+	/**
+	 * Aggregate function that tests raw types in map views.
+	 */
+	public static class RawMapViewAggregateFunction
+			extends AggregateFunction<String, RawMapViewAggregateFunction.AccWithRawView> {
+
+		/**
+		 * POJO is invalid and needs to be treated as raw type.
+		 */
+		public static class RawPojo {
+			public String a;
+			public int b;
+
+			public RawPojo(String s) {
+				this.a = s;
+				this.b = s.length();
+			}
+
+			@Override
+			public String toString() {
+				return "(" + a + ", " + b + ')';
+			}
+		}
+
+		/**
+		 * Accumulator with view that maps to raw type.
+		 */
+		public static class AccWithRawView {
+			@DataTypeHint(allowRawGlobally = HintFlag.TRUE)
+			public MapView<String, RawPojo> view = new MapView<>();
+		}
+
+		@Override
+		public AccWithRawView createAccumulator() {
+			return new AccWithRawView();
+		}
+
+		public void accumulate(AccWithRawView acc, String value) throws Exception {
+			if (value != null) {
+				acc.view.put(value, new RawPojo(value));
+			}
+		}
+
+		@Override
+		public String getValue(AccWithRawView acc) {
+			return acc.view.getMap().entrySet()
+				.stream()
+				.map(Objects::toString)
+				.sorted()
+				.collect(Collectors.joining(", "));
+		}
+	}
+
+	/**
+	 * Synchronous table function that uses regular type inference for {@link LookupTableSource}.
+	 */
+	@DataTypeHint("ROW<s STRING, b BYTES>")
+	public static class LookupTableFunction extends TableFunction<Object> {
+		public void eval(@DataTypeHint("STRING") StringData s) {
+			collect(Row.of(s.toString(), new byte[0]));
+			collect(Row.of(s.toString(), s.toBytes()));
 		}
 	}
 }

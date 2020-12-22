@@ -46,6 +46,7 @@ FLINK_OVER_WINDOW_ARROW_CODER_URN = "flink:coder:schema:batch_over_window:arrow:
 # datastream coders
 FLINK_MAP_CODER_URN = "flink:coder:map:v1"
 FLINK_FLAT_MAP_CODER_URN = "flink:coder:flat_map:v1"
+FLINK_CO_FLAT_MAP_CODER_URN = "flink:coder:co_flat_map:v1"
 
 
 class BaseCoder(ABC):
@@ -163,7 +164,7 @@ class DataStreamMapCoder(BaseCoder):
         return DataStreamMapCoder(from_type_info_proto(type_info_proto.field[0].type))
 
     def __repr__(self):
-        return 'DataStreamStatelessMapCoder[%s]' % ', '.join(str(c) for c in self._field_coders)
+        return 'DataStreamMapCoder[%s]' % ', '.join(str(c) for c in self._field_coders)
 
     def __eq__(self, other):
         return (self.__class__ == other.__class__
@@ -195,7 +196,39 @@ class DataStreamFlatMapCoder(BaseCoder):
         return DataStreamFlatMapCoder(from_type_info_proto(type_info_proto.field[0].type))
 
     def __repr__(self):
-        return 'DataStreamStatelessFlatMapCoder[%s]' % ', '.join(str(c) for c in self._field_coders)
+        return 'DataStreamFlatMapCoder[%s]' % ', '.join(str(c) for c in self._field_coders)
+
+    def __eq__(self, other):
+        return (self.__class__ == other.__class__
+                and len(self._field_coders) == len(other._field_coders)
+                and [self._field_coders[i] == other._field_coders[i] for i in
+                     range(len(self._field_coders))])
+
+    def __ne__(self, other):
+        return not self == other
+
+    def __hash__(self):
+        return hash(self._field_coders)
+
+
+class DataStreamCoFlatMapCoder(BaseCoder):
+    """
+    Coder for a DataStream CoFlatMap Function input/output data.
+    """
+
+    def __init__(self, field_codes):
+        self._field_coders = field_codes
+
+    def get_impl(self):
+        return coder_impl.DataStreamCoFlatMapCoderImpl(
+            DataStreamMapCoder(self._field_coders).get_impl())
+
+    @staticmethod
+    def from_type_info_proto(type_info_proto):
+        return DataStreamCoFlatMapCoder(from_type_info_proto(type_info_proto.field[0].type))
+
+    def __repr__(self):
+        return 'DataStreamCoFlatMapCoder[%s]' % ', '.join(str(c) for c in self._field_coders)
 
     def __eq__(self, other):
         return (self.__class__ == other.__class__
@@ -221,18 +254,20 @@ class RowCoder(FieldCoder, BaseCoder):
     Coder for Row.
     """
 
-    def __init__(self, field_coders):
+    def __init__(self, field_coders, field_names):
         self._field_coders = field_coders
+        self._field_names = field_names
 
     def get_impl(self):
-        return coder_impl.RowCoderImpl([c.get_impl() for c in self._field_coders])
+        return coder_impl.RowCoderImpl([c.get_impl() for c in self._field_coders],
+                                       self._field_names)
 
     def __repr__(self):
         return 'RowCoder[%s]' % ', '.join(str(c) for c in self._field_coders)
 
     def __eq__(self, other):
         return (self.__class__ == other.__class__
-                and len(self._field_coders) == len(other._field_coders)
+                and self._field_names == other._field_names
                 and [self._field_coders[i] == other._field_coders[i] for i in
                      range(len(self._field_coders))])
 
@@ -519,7 +554,8 @@ def from_proto(field_type):
     if coder is not None:
         return coder
     if field_type_name == type_name.ROW:
-        return RowCoder([from_proto(f.type) for f in field_type.row_schema.fields])
+        return RowCoder([from_proto(f.type) for f in field_type.row_schema.fields],
+                        [f.name for f in field_type.row_schema.fields])
     if field_type_name == type_name.TIMESTAMP:
         return TimestampCoder(field_type.timestamp_info.precision)
     if field_type_name == type_name.LOCAL_ZONED_TIMESTAMP:
@@ -564,7 +600,8 @@ def from_type_info_proto(field_type):
         return _type_info_name_mappings[field_type_name]
     except KeyError:
         if field_type_name == type_info_name.ROW:
-            return RowCoder([from_type_info_proto(f.type) for f in field_type.row_type_info.field])
+            return RowCoder([from_type_info_proto(f.type) for f in field_type.row_type_info.field],
+                            [f.name for f in field_type.row_type_info.field])
 
         if field_type_name == type_info_name.PRIMITIVE_ARRAY:
             return PrimitiveArrayCoder(from_type_info_proto(field_type.collection_element_type))

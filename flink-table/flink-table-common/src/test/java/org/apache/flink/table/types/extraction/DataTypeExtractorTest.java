@@ -29,6 +29,7 @@ import org.apache.flink.table.api.ValidationException;
 import org.apache.flink.table.api.dataview.ListView;
 import org.apache.flink.table.api.dataview.MapView;
 import org.apache.flink.table.catalog.DataTypeFactory;
+import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.functions.TableFunction;
 import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.types.FieldsDataType;
@@ -122,6 +123,14 @@ public class DataTypeExtractorTest {
 				.expectErrorMessage(
 					"Cannot extract a data type from a pure 'org.apache.flink.types.Row' class. " +
 						"Please use annotations to define field names and field types."),
+
+			// unsupported internal data type exception
+			TestSpec
+				.forType(RowData.class)
+				.expectErrorMessage(
+					"Cannot extract a data type from an internal 'org.apache.flink.table.data.RowData' "
+						+ "class without further information. Please use annotations to define the "
+						+ "full logical type."),
 
 			// explicit precision/scale through data type
 			TestSpec
@@ -434,6 +443,15 @@ public class DataTypeExtractorTest {
 					PojoWithRawSelfReference.class)
 				.lookupExpects(PojoWithRawSelfReference.class)
 				.expectDataType(getPojoWithRawSelfReferenceDataType()),
+
+			TestSpec
+				.forType(
+					"Data view with invalid list element",
+					AccumulatorWithInvalidDefaultDataView.class)
+				.expectErrorMessage(
+					"Could not extract a data type from '" + ListView.class.getName()
+						+ "<" + Object.class.getName() + ">'. "
+						+ "Please pass the required data type manually or allow RAW types."),
 
 			TestSpec
 				.forType(
@@ -1104,6 +1122,13 @@ public class DataTypeExtractorTest {
 	}
 
 	// --------------------------------------------------------------------------------------------
+
+	/**
+	 * Accumulator with invalid default extraction for data view.
+	 */
+	public static class AccumulatorWithInvalidDefaultDataView {
+		public ListView<Object> listView;
+	}
 
 	/**
 	 * Accumulator with default extraction for data view.

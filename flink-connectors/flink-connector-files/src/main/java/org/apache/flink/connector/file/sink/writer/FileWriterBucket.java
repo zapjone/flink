@@ -49,6 +49,11 @@ import static org.apache.flink.util.Preconditions.checkState;
  *
  * <p>For each incoming element in the {@code FileSink}, the user-specified
  * {@link BucketAssigner} is queried to see in which bucket this element should be written to.
+ *
+ * <p>This writer is responsible for writing the input data and managing the staging area
+ * used by a bucket to temporarily store in-progress, uncommitted data.
+ *
+ * @param <IN> The type of input elements.
  */
 @Internal
 class FileWriterBucket<IN> {
@@ -113,6 +118,10 @@ class FileWriterBucket<IN> {
 				outputFileConfig);
 
 		restoreInProgressFile(bucketState);
+
+		// Restore pending files, this only make difference if we are
+		// migrating from {@code StreamingFileSink}.
+		cacheRecoveredPendingFiles(bucketState);
 	}
 
 	private void restoreInProgressFile(FileWriterBucketState state) throws IOException {
@@ -129,6 +138,14 @@ class FileWriterBucket<IN> {
 					bucketId, inProgressFileRecoverable, state.getInProgressFileCreationTime());
 		} else {
 			pendingFiles.add(inProgressFileRecoverable);
+		}
+	}
+
+	private void cacheRecoveredPendingFiles(FileWriterBucketState state) {
+		// Cache the previous pending files and send to committer on the first prepareCommit operation.
+		for (List<InProgressFileWriter.PendingFileRecoverable> restoredPendingRecoverables :
+				state.getPendingFileRecoverablesPerCheckpoint().values()) {
+			pendingFiles.addAll(restoredPendingRecoverables);
 		}
 	}
 

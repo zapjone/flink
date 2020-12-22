@@ -47,7 +47,12 @@ import static org.apache.flink.util.Preconditions.checkNotNull;
 import static org.apache.flink.util.Preconditions.checkState;
 
 /**
- * Writer implementation for {@link FileSink}.
+ * A {@link SinkWriter} implementation for {@link FileSink}.
+ *
+ * <p>It writes data to and manages the different active {@link FileWriterBucket buckes}
+ * in the {@link FileSink}.
+ *
+ * @param <IN> The type of input elements.
  */
 @Internal
 public class FileWriter<IN> implements
@@ -80,10 +85,6 @@ public class FileWriter<IN> implements
 
 	private final OutputFileConfig outputFileConfig;
 
-	// --------------------------- State Related Fields -----------------------------
-
-	private final FileWriterBucketStateSerializer bucketStateSerializer;
-
 	/**
 	 * A constructor creating a new empty bucket manager.
 	 *
@@ -113,9 +114,6 @@ public class FileWriter<IN> implements
 
 		this.activeBuckets = new HashMap<>();
 		this.bucketerContext = new BucketerContext();
-
-		this.bucketStateSerializer = new FileWriterBucketStateSerializer(
-				bucketWriter.getProperties().getInProgressFileRecoverableSerializer());
 
 		this.processingTimeService = checkNotNull(processingTimeService);
 		checkArgument(
@@ -179,7 +177,8 @@ public class FileWriter<IN> implements
 		// setting the values in the bucketer context
 		bucketerContext.update(
 				context.timestamp(),
-				context.currentWatermark());
+				context.currentWatermark(),
+				processingTimeService.getCurrentProcessingTime());
 
 		final String bucketId = bucketAssigner.getBucketId(element, bucketerContext);
 		final FileWriterBucket<IN> bucket = getOrCreateBucketForBucketId(bucketId);
@@ -210,7 +209,7 @@ public class FileWriter<IN> implements
 	@Override
 	public List<FileWriterBucketState> snapshotState() throws IOException {
 		checkState(
-				bucketWriter != null && bucketStateSerializer != null,
+				bucketWriter != null,
 				"sink has not been initialized");
 
 		List<FileWriterBucketState> state = new ArrayList<>();
@@ -276,19 +275,23 @@ public class FileWriter<IN> implements
 
 		private long currentWatermark;
 
+		private long currentProcessingTime;
+
 		private BucketerContext() {
 			this.elementTimestamp = null;
 			this.currentWatermark = Long.MIN_VALUE;
+			this.currentProcessingTime = Long.MIN_VALUE;
 		}
 
-		void update(@Nullable Long elementTimestamp, long watermark) {
+		void update(@Nullable Long elementTimestamp, long watermark, long currentProcessingTime) {
 			this.elementTimestamp = elementTimestamp;
 			this.currentWatermark = watermark;
+			this.currentProcessingTime = currentProcessingTime;
 		}
 
 		@Override
 		public long currentProcessingTime() {
-			throw new UnsupportedOperationException("not supported");
+			return currentProcessingTime;
 		}
 
 		@Override

@@ -53,9 +53,9 @@ that triggers the execution, or in the command line process `./bin/flink run
 
 The JobManager and TaskManagers can be started in various ways: directly on
 the machines as a [standalone cluster]({% link
-ops/deployment/cluster_setup.md %}), in containers, or managed by resource
-frameworks like [YARN]({% link ops/deployment/yarn_setup.md
-%}) or [Mesos]({% link ops/deployment/mesos.md %}).
+deployment/resource-providers/standalone/index.md %}), in containers, or managed by resource
+frameworks like [YARN]({% link deployment/resource-providers/yarn.md
+%}) or [Mesos]({% link deployment/resource-providers/mesos.md %}).
 TaskManagers connect to JobManagers, announcing themselves as available, and
 are assigned work.
 
@@ -92,7 +92,7 @@ failures, among others. This process consists of three different components:
 
 There is always at least one JobManager. A high-availability setup might have
 multiple JobManagers, one of which is always the *leader*, and the others are
-*standby* (see [High Availability (HA)]({% link ops/jobmanager_high_availability.md %})).
+*standby* (see [High Availability (HA)]({% link deployment/ha/index.md %})).
 
 ### TaskManagers
 
@@ -169,7 +169,7 @@ A _Flink Application_ is any user program that spawns one or multiple Flink
 jobs from its ``main()`` method. The execution of these jobs can happen in a
 local JVM (``LocalEnvironment``) or on a remote setup of clusters with multiple
 machines (``RemoteEnvironment``). For each program, the
-[``ExecutionEnvironment``]({{ site.baseurl }}/api/java/) provides methods to
+[``ExecutionEnvironment``]({{ site.javadocs_baseurl }}/api/java/) provides methods to
 control the job execution (e.g. setting the parallelism) and to interact with
 the outside world (see [Anatomy of a Flink Program]({%
 link dev/datastream_api.md %}#anatomy-of-a-flink-program)).

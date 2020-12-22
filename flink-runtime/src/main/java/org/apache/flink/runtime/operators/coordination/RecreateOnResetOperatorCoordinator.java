@@ -21,6 +21,7 @@ package org.apache.flink.runtime.operators.coordination;
 import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.runtime.jobgraph.OperatorID;
 import org.apache.flink.runtime.messages.Acknowledge;
+import org.apache.flink.util.Preconditions;
 import org.apache.flink.util.function.ThrowingConsumer;
 import org.apache.flink.util.function.ThrowingRunnable;
 
@@ -29,11 +30,12 @@ import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 
+import java.time.Duration;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.LinkedBlockingQueue;
 
-import static org.apache.flink.util.ComponentClosingUtils.closeAsyncWithTimeout;
+import static org.apache.flink.runtime.operators.coordination.ComponentClosingUtils.closeAsyncWithTimeout;
 
 /**
  * A class that will recreate a new {@link OperatorCoordinator} instance when
@@ -46,7 +48,7 @@ public class RecreateOnResetOperatorCoordinator implements OperatorCoordinator {
 	private final long closingTimeoutMs;
 	private final OperatorCoordinator.Context context;
 	private DeferrableCoordinator coordinator;
-	private volatile boolean started;
+	private  boolean started;
 	private volatile boolean closed;
 
 	private RecreateOnResetOperatorCoordinator(
@@ -65,8 +67,11 @@ public class RecreateOnResetOperatorCoordinator implements OperatorCoordinator {
 
 	@Override
 	public void start() throws Exception {
-		coordinator.start();
+		Preconditions.checkState(!started, "coordinator already started");
 		started = true;
+		coordinator.applyCall(
+			"start",
+			OperatorCoordinator::start);
 	}
 
 	@Override
@@ -90,6 +95,13 @@ public class RecreateOnResetOperatorCoordinator implements OperatorCoordinator {
 	}
 
 	@Override
+	public void subtaskReset(int subtask, long checkpointId) {
+		coordinator.applyCall(
+			"subtaskReset",
+			c -> c.subtaskReset(subtask, checkpointId));
+	}
+
+	@Override
 	public void checkpointCoordinator(long checkpointId, CompletableFuture<byte[]> resultFuture) throws Exception {
 		coordinator.applyCall(
 				"checkpointCoordinator",
@@ -104,7 +116,7 @@ public class RecreateOnResetOperatorCoordinator implements OperatorCoordinator {
 	}
 
 	@Override
-	public void resetToCheckpoint(byte[] checkpointData) throws Exception {
+	public void resetToCheckpoint(final long checkpointId, @Nullable final byte[] checkpointData) {
 		// First bump up the coordinator epoch to fence out the active coordinator.
 		LOG.info("Resetting coordinator to checkpoint.");
 		// Replace the coordinator variable with a new DeferrableCoordinator instance.
@@ -117,12 +129,16 @@ public class RecreateOnResetOperatorCoordinator implements OperatorCoordinator {
 		// Close the old coordinator asynchronously in a separate closing thread.
 		// The future will be completed when the old coordinator closes.
 		CompletableFuture<Void> closingFuture = oldCoordinator.closeAsync(closingTimeoutMs);
-		// Create and
+
+		// Create and possibly start the coordinator and apply all meanwhile deferred calls
+		// capture the status whether the coordinator was started when this method was called
+		final boolean wasStarted = this.started;
+
 		closingFuture.thenRun(() -> {
 			if (!closed) {
 				// The previous coordinator has closed. Create a new one.
 				newCoordinator.createNewInternalCoordinator(context, provider);
-				newCoordinator.resetAndStart(checkpointData, started);
+				newCoordinator.resetAndStart(checkpointId, checkpointData, wasStarted);
 				newCoordinator.processPendingCalls();
 			}
 		});
@@ -226,6 +242,11 @@ public class RecreateOnResetOperatorCoordinator implements OperatorCoordinator {
 			return context.currentParallelism();
 		}
 
+		@Override
+		public ClassLoader getUserCodeClassloader() {
+			return context.getUserCodeClassloader();
+		}
+
 		@VisibleForTesting
 		synchronized void quiesce() {
 			quiesced = true;
@@ -242,7 +263,7 @@ public class RecreateOnResetOperatorCoordinator implements OperatorCoordinator {
 	}
 
 	/**
-	 * A class that helps realize the fully async {@link #resetToCheckpoint(byte[])} behavior.
+	 * A class that helps realize the fully async {@link #resetToCheckpoint(long, byte[])} behavior.
 	 * The class wraps an {@link OperatorCoordinator} instance. It is going to be accessed
 	 * by two different thread: the scheduler thread and the closing thread created in
 	 * {@link #closeAsync(long)}. A DeferrableCoordinator could be in three states:
@@ -318,7 +339,7 @@ public class RecreateOnResetOperatorCoordinator implements OperatorCoordinator {
 				return closeAsyncWithTimeout(
 					"SourceCoordinator for " + operatorId,
 					(ThrowingRunnable<Exception>) internalCoordinator::close,
-					timeoutMs).exceptionally(e -> {
+					Duration.ofMillis(timeoutMs)).exceptionally(e -> {
 						cleanAndFailJob(e);
 						return null;
 					});
@@ -360,12 +381,16 @@ public class RecreateOnResetOperatorCoordinator implements OperatorCoordinator {
 			internalCoordinator.start();
 		}
 
-		void resetAndStart(byte[] checkpointData, boolean started) {
+		void resetAndStart(
+				final long checkpointId,
+				@Nullable final byte[] checkpointData,
+				final boolean started) {
+
 			if (failed || closed || internalCoordinator == null) {
 				return;
 			}
 			try {
-				internalCoordinator.resetToCheckpoint(checkpointData);
+				internalCoordinator.resetToCheckpoint(checkpointId, checkpointData);
 				// Start the new coordinator if this coordinator has been started before reset to the checkpoint.
 				if (started) {
 					internalCoordinator.start();

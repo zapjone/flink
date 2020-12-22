@@ -39,6 +39,7 @@ import org.apache.flink.core.testutils.OneShotLatch;
 import org.apache.flink.queryablestate.KvStateID;
 import org.apache.flink.runtime.akka.AkkaUtils;
 import org.apache.flink.runtime.checkpoint.CheckpointProperties;
+import org.apache.flink.runtime.checkpoint.CheckpointRecoveryFactory;
 import org.apache.flink.runtime.checkpoint.CheckpointRetentionPolicy;
 import org.apache.flink.runtime.checkpoint.Checkpoints;
 import org.apache.flink.runtime.checkpoint.CheckpointsCleaner;
@@ -48,7 +49,6 @@ import org.apache.flink.runtime.checkpoint.OperatorSubtaskState;
 import org.apache.flink.runtime.checkpoint.StandaloneCheckpointIDCounter;
 import org.apache.flink.runtime.checkpoint.StandaloneCheckpointRecoveryFactory;
 import org.apache.flink.runtime.checkpoint.StandaloneCompletedCheckpointStore;
-import org.apache.flink.runtime.checkpoint.TestingCheckpointRecoveryFactory;
 import org.apache.flink.runtime.checkpoint.metadata.CheckpointMetadata;
 import org.apache.flink.runtime.clusterframework.types.AllocationID;
 import org.apache.flink.runtime.clusterframework.types.ResourceID;
@@ -182,6 +182,7 @@ import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
+import static org.apache.flink.runtime.checkpoint.PerJobCheckpointRecoveryFactory.useSameServicesForAllJobs;
 import static org.apache.flink.runtime.checkpoint.StateHandleDummyUtil.createNewInputChannelStateHandle;
 import static org.apache.flink.runtime.checkpoint.StateHandleDummyUtil.createNewResultSubpartitionStateHandle;
 import static org.apache.flink.runtime.checkpoint.StateObjectCollection.singleton;
@@ -651,7 +652,7 @@ public class JobMasterTest extends TestLogger {
 		}
 
 		@Override
-		public Optional<PhysicalSlot> allocateAvailableSlot(@Nonnull SlotRequestId slotRequestId, @Nonnull AllocationID allocationID) {
+		public Optional<PhysicalSlot> allocateAvailableSlot(@Nonnull SlotRequestId slotRequestId, @Nonnull AllocationID allocationID, @Nonnull ResourceProfile requirementProfile) {
 			throw new UnsupportedOperationException("TestingSlotPool does not support this operation.");
 		}
 
@@ -781,7 +782,7 @@ public class JobMasterTest extends TestLogger {
 		final JobGraph jobGraph = createJobGraphWithCheckpointing(savepointRestoreSettings);
 
 		final StandaloneCompletedCheckpointStore completedCheckpointStore = new StandaloneCompletedCheckpointStore(1);
-		final TestingCheckpointRecoveryFactory testingCheckpointRecoveryFactory = new TestingCheckpointRecoveryFactory(completedCheckpointStore, new StandaloneCheckpointIDCounter());
+		final CheckpointRecoveryFactory testingCheckpointRecoveryFactory = useSameServicesForAllJobs(completedCheckpointStore, new StandaloneCheckpointIDCounter());
 		haServices.setCheckpointRecoveryFactory(testingCheckpointRecoveryFactory);
 		final JobMaster jobMaster = createJobMaster(
 			configuration,
@@ -824,7 +825,7 @@ public class JobMasterTest extends TestLogger {
 		final JobGraph jobGraphWithNewOperator = createJobGraphFromJobVerticesWithCheckpointing(savepointRestoreSettings, jobVertex);
 
 		final StandaloneCompletedCheckpointStore completedCheckpointStore = new StandaloneCompletedCheckpointStore(1);
-		final TestingCheckpointRecoveryFactory testingCheckpointRecoveryFactory = new TestingCheckpointRecoveryFactory(completedCheckpointStore, new StandaloneCheckpointIDCounter());
+		final CheckpointRecoveryFactory testingCheckpointRecoveryFactory = useSameServicesForAllJobs(completedCheckpointStore, new StandaloneCheckpointIDCounter());
 		haServices.setCheckpointRecoveryFactory(testingCheckpointRecoveryFactory);
 
 		try {
@@ -894,7 +895,7 @@ public class JobMasterTest extends TestLogger {
 		final StandaloneCompletedCheckpointStore completedCheckpointStore = new StandaloneCompletedCheckpointStore(1);
 		completedCheckpointStore.addCheckpoint(completedCheckpoint, new CheckpointsCleaner(), () -> {
 		});
-		final TestingCheckpointRecoveryFactory testingCheckpointRecoveryFactory = new TestingCheckpointRecoveryFactory(completedCheckpointStore, new StandaloneCheckpointIDCounter());
+		final CheckpointRecoveryFactory testingCheckpointRecoveryFactory = useSameServicesForAllJobs(completedCheckpointStore, new StandaloneCheckpointIDCounter());
 		haServices.setCheckpointRecoveryFactory(testingCheckpointRecoveryFactory);
 
 		final JobMaster jobMaster = createJobMaster(
@@ -1967,58 +1968,6 @@ public class JobMasterTest extends TestLogger {
 				jobMasterGateway.heartbeatFromTaskManager(taskManagerResourceId, TaskExecutorToJobManagerHeartbeatPayload.empty());
 			}
 		);
-	}
-
-	/**
-	 * Tests that the job gets suspended when the JobMaster stops. See FLINK-20033.
-	 */
-	@Test
-	public void testJobSuspensionWhenJobMasterStops() throws Exception {
-		final JobMasterBuilder.TestingOnCompletionActions onCompletionActions = new JobMasterBuilder.TestingOnCompletionActions();
-
-		final JobMaster jobMaster = createJobMaster(
-			configuration,
-			JobGraphTestUtils.createSingleVertexJobGraph(),
-			haServices,
-			new TestingJobManagerSharedServicesBuilder().build(),
-			heartbeatServices,
-			onCompletionActions);
-
-		CompletableFuture<Acknowledge> startFuture = jobMaster.start(jobMasterId);
-
-		try {
-			// wait for the start of the JobMaster
-			startFuture.get();
-
-			final CompletableFuture<TaskDeploymentDescriptor> tddFuture = new CompletableFuture<>();
-			final TestingTaskExecutorGateway testingTaskExecutorGateway = new TestingTaskExecutorGatewayBuilder()
-				.setSubmitTaskConsumer((taskDeploymentDescriptor, jobMasterId) -> {
-					tddFuture.complete(taskDeploymentDescriptor);
-					return CompletableFuture.completedFuture(Acknowledge.get());
-				})
-				.createTestingTaskExecutorGateway();
-			final LocalUnresolvedTaskManagerLocation taskManagerLocation = new LocalUnresolvedTaskManagerLocation();
-			final JobMasterGateway jobMasterGateway = jobMaster.getSelfGateway(JobMasterGateway.class);
-
-			registerSlotsAtJobMaster(1, jobMasterGateway, testingTaskExecutorGateway, taskManagerLocation);
-
-			// wait for deployment
-			tddFuture.get();
-
-			// trigger termination of JobMaster and also the job
-			jobMaster.close();
-
-			try {
-				final ArchivedExecutionGraph archivedExecutionGraph = onCompletionActions
-					.getJobReachedGloballyTerminalStateFuture()
-					.get(50, TimeUnit.MILLISECONDS);
-				fail(String.format("Job must not reach the globally terminal state %s when stopping the JobMaster.", archivedExecutionGraph.getState()));
-			} catch (TimeoutException expected) {
-				// expected
-			}
-		} finally {
-			RpcUtils.terminateRpcEndpoint(jobMaster, testingTimeout);
-		}
 	}
 
 	private void runJobFailureWhenTaskExecutorTerminatesTest(

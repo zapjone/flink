@@ -28,7 +28,6 @@ import org.apache.flink.runtime.io.network.api.CheckpointBarrier;
 import org.apache.flink.runtime.io.network.buffer.Buffer;
 import org.apache.flink.runtime.io.network.buffer.FileRegionBuffer;
 import org.apache.flink.runtime.io.network.partition.BufferAvailabilityListener;
-import org.apache.flink.runtime.io.network.partition.ChannelStateHolder;
 import org.apache.flink.runtime.io.network.partition.PartitionNotFoundException;
 import org.apache.flink.runtime.io.network.partition.ResultPartitionID;
 import org.apache.flink.runtime.io.network.partition.ResultPartitionManager;
@@ -52,7 +51,7 @@ import static org.apache.flink.util.Preconditions.checkState;
 /**
  * An input channel, which requests a local subpartition.
  */
-public class LocalInputChannel extends InputChannel implements BufferAvailabilityListener, ChannelStateHolder {
+public class LocalInputChannel extends InputChannel implements BufferAvailabilityListener {
 
 	private static final Logger LOG = LoggerFactory.getLogger(LocalInputChannel.class);
 
@@ -71,7 +70,7 @@ public class LocalInputChannel extends InputChannel implements BufferAvailabilit
 
 	private volatile boolean isReleased;
 
-	private ChannelStatePersister channelStatePersister = new ChannelStatePersister(null);
+	private final ChannelStatePersister channelStatePersister;
 
 	public LocalInputChannel(
 		SingleInputGate inputGate,
@@ -82,7 +81,7 @@ public class LocalInputChannel extends InputChannel implements BufferAvailabilit
 		Counter numBytesIn,
 		Counter numBuffersIn) {
 
-		this(inputGate, channelIndex, partitionId, partitionManager, taskEventPublisher, 0, 0, numBytesIn, numBuffersIn);
+		this(inputGate, channelIndex, partitionId, partitionManager, taskEventPublisher, 0, 0, numBytesIn, numBuffersIn, ChannelStateWriter.NO_OP);
 	}
 
 	public LocalInputChannel(
@@ -94,29 +93,26 @@ public class LocalInputChannel extends InputChannel implements BufferAvailabilit
 		int initialBackoff,
 		int maxBackoff,
 		Counter numBytesIn,
-		Counter numBuffersIn) {
+		Counter numBuffersIn,
+		ChannelStateWriter stateWriter) {
 
 		super(inputGate, channelIndex, partitionId, initialBackoff, maxBackoff, numBytesIn, numBuffersIn);
 
 		this.partitionManager = checkNotNull(partitionManager);
 		this.taskEventPublisher = checkNotNull(taskEventPublisher);
+		this.channelStatePersister = new ChannelStatePersister(stateWriter, getChannelInfo());
 	}
 
 	// ------------------------------------------------------------------------
 	// Consume
 	// ------------------------------------------------------------------------
 
-	public void setChannelStateWriter(ChannelStateWriter channelStateWriter) {
-		checkState(!channelStatePersister.isInitialized(), "Already initialized");
-		channelStatePersister = new ChannelStatePersister(checkNotNull(channelStateWriter));
-	}
-
 	public void checkpointStarted(CheckpointBarrier barrier) {
 		channelStatePersister.startPersisting(barrier.getId(), Collections.emptyList());
 	}
 
 	public void checkpointStopped(long checkpointId) {
-		channelStatePersister.stopPersisting();
+		channelStatePersister.stopPersisting(checkpointId);
 	}
 
 	@Override
@@ -233,11 +229,8 @@ public class LocalInputChannel extends InputChannel implements BufferAvailabilit
 
 		numBytesIn.inc(buffer.getSize());
 		numBuffersIn.inc();
-		if (buffer.getDataType().hasPriority()) {
-			channelStatePersister.checkForBarrier(buffer);
-		} else {
-			channelStatePersister.maybePersist(buffer);
-		}
+		channelStatePersister.checkForBarrier(buffer);
+		channelStatePersister.maybePersist(buffer);
 		return Optional.of(new BufferAndAvailability(
 			buffer,
 			next.getNextDataType(),

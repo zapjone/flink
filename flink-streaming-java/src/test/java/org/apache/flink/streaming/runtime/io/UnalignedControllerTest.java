@@ -57,6 +57,7 @@ import java.util.Random;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
+import static org.apache.flink.runtime.state.CheckpointStorageLocationReference.getDefault;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertThat;
@@ -615,7 +616,7 @@ public class UnalignedControllerTest {
 			new CheckpointBarrier(
 				checkpointId,
 				timestamp,
-				CheckpointOptions.forCheckpointWithDefaultLocation()),
+				CheckpointOptions.unaligned(getDefault())),
 			new InputChannelInfo(0, channel));
 	}
 
@@ -650,11 +651,11 @@ public class UnalignedControllerTest {
 			.mapToObj(channelIndex ->
 				InputChannelBuilder.newBuilder()
 					.setChannelIndex(channelIndex)
+					.setStateWriter(channelStateWriter)
 					.setupFromNettyShuffleEnvironment(environment)
 					.setConnectionManager(new TestingConnectionManager())
 					.buildRemoteChannel(gate))
 			.toArray(RemoteInputChannel[]::new));
-		gate.setChannelStateWriter(channelStateWriter);
 		sequenceNumbers = new int[numberOfChannels];
 
 		gate.setup();
@@ -704,8 +705,9 @@ public class UnalignedControllerTest {
 	}
 
 	private void assertInflightData(BufferOrEvent... expected) {
-		assertEquals("Unexpected in-flight sequence", getIds(Arrays.asList(expected)),
-			getIds(getAndResetInflightData()));
+		Collection<BufferOrEvent> andResetInflightData = getAndResetInflightData();
+		assertEquals("Unexpected in-flight sequence: " + andResetInflightData, getIds(Arrays.asList(expected)),
+			getIds(andResetInflightData));
 	}
 
 	private Collection<BufferOrEvent> getAndResetInflightData() {
@@ -728,7 +730,7 @@ public class UnalignedControllerTest {
 	}
 
 	private CheckpointBarrier buildCheckpointBarrier(long id) {
-		return new CheckpointBarrier(id, 0, CheckpointOptions.forCheckpointWithDefaultLocation());
+		return new CheckpointBarrier(id, 0, CheckpointOptions.unaligned(getDefault()));
 	}
 
 	// ------------------------------------------------------------------------

@@ -104,12 +104,17 @@ public class UpsertKafkaTableITCase extends KafkaTestBaseWithFlink {
 	@Test
 	public void testTemporalJoin() throws Exception {
 		String topic = USERS_TOPIC + "_" + format;
-		// use single parallelism and partition to guarantee fine-grained watermark progress
-		// TODO: use 4 parallelism and partitions once FLINK-19878 is fixed
-		env.setParallelism(1);
-		createTestTopic(topic, 1, 1);
+		createTestTopic(topic, 2, 1);
 		// -------------   test   ---------------
+		// Kafka DefaultPartitioner's hash strategy is slightly different from Flink KeyGroupStreamPartitioner,
+		// which causes the records in the different Flink partitions are written into the same Kafka partition.
+		// When reading from the out-of-order Kafka partition, we need to set suitable watermark interval to
+		// tolerate the disorderliness.
+		// For convenience, we just set the parallelism 1 to make all records are in the same Flink partition and
+		// use the Kafka DefaultPartition to repartition the records.
+		env.setParallelism(1);
 		writeChangelogToUpsertKafkaWithMetadata(topic);
+		env.setParallelism(2);
 		temporalJoinUpsertKafka(topic);
 		// ------------- clean up ---------------
 		deleteTestTopic(topic);
@@ -392,15 +397,20 @@ public class UpsertKafkaTableITCase extends KafkaTestBaseWithFlink {
 		// ------------- test data ---------------
 
 		// Prepare data for upsert kafka
+		// Keep every partition has more than 1 record and the last record in every partition has larger event time
+		// than left stream event time to trigger the join.
 		List<Row> changelogData = Arrays.asList(
 			changelogRow("+U", 100L, "Bob", "Beijing", LocalDateTime.parse("2020-08-15T00:00:01")),
 			changelogRow("+U", 101L, "Alice", "Shanghai", LocalDateTime.parse("2020-08-15T00:00:02")),
 			changelogRow("+U", 102L, "Greg", "Berlin", LocalDateTime.parse("2020-08-15T00:00:03")),
 			changelogRow("+U", 103L, "Richard", "Berlin", LocalDateTime.parse("2020-08-16T00:01:05")),
+			changelogRow("+U", 103L, "Richard", "London", LocalDateTime.parse("2020-08-16T01:01:05")),
 			changelogRow("+U", 101L, "Alice", "Wuhan", LocalDateTime.parse("2020-08-16T00:02:00")),
-			changelogRow("+U", 101L, "Alice", "Hangzhou", LocalDateTime.parse("2020-08-16T00:04:05")),
+			changelogRow("+U", 101L, "Alice", "Hangzhou", LocalDateTime.parse("2020-08-16T01:04:05")),
 			changelogRow("+U", 104L, "Tomato", "Hongkong", LocalDateTime.parse("2020-08-16T00:05:05")),
-			changelogRow("+U", 105L, "Tim", "Shenzhen", LocalDateTime.parse("2020-08-16T00:06:00"))
+			changelogRow("+U", 104L, "Tomato", "Shenzhen", LocalDateTime.parse("2020-08-16T01:05:05")),
+			changelogRow("+U", 105L, "Tim", "Shenzhen", LocalDateTime.parse("2020-08-16T00:06:00")),
+			changelogRow("+U", 105L, "Tim", "Hongkong", LocalDateTime.parse("2020-08-16T01:06:00"))
 		);
 
 		// ------------- create table ---------------
@@ -451,7 +461,7 @@ public class UpsertKafkaTableITCase extends KafkaTestBaseWithFlink {
 
 		// ---------- consume stream from sink -------------------
 
-		final List<Row> result = collectRows(tEnv.sqlQuery("SELECT * FROM " + userTable), 10);
+		final List<Row> result = collectRows(tEnv.sqlQuery("SELECT * FROM " + userTable), 16);
 
 		List<Row> expected = Arrays.asList(
 			changelogRow("+I", 100L, "Bob", "Beijing", "BEIJING", LocalDateTime.parse("2020-08-15T00:00:01")),
@@ -459,11 +469,17 @@ public class UpsertKafkaTableITCase extends KafkaTestBaseWithFlink {
 			changelogRow("-U", 101L, "Alice", "Shanghai", "SHANGHAI", LocalDateTime.parse("2020-08-15T00:00:02")),
 			changelogRow("+U", 101L, "Alice", "Wuhan", "WUHAN", LocalDateTime.parse("2020-08-16T00:02:00")),
 			changelogRow("-U", 101L, "Alice", "Wuhan", "WUHAN", LocalDateTime.parse("2020-08-16T00:02:00")),
-			changelogRow("+U", 101L, "Alice", "Hangzhou", "HANGZHOU", LocalDateTime.parse("2020-08-16T00:04:05")),
+			changelogRow("+U", 101L, "Alice", "Hangzhou", "HANGZHOU", LocalDateTime.parse("2020-08-16T01:04:05")),
 			changelogRow("+I", 102L, "Greg", "Berlin", "BERLIN", LocalDateTime.parse("2020-08-15T00:00:03")),
 			changelogRow("+I", 103L, "Richard", "Berlin", "BERLIN", LocalDateTime.parse("2020-08-16T00:01:05")),
+			changelogRow("-U", 103L, "Richard", "Berlin", "BERLIN", LocalDateTime.parse("2020-08-16T00:01:05")),
+			changelogRow("+U", 103L, "Richard", "London", "LONDON", LocalDateTime.parse("2020-08-16T01:01:05")),
 			changelogRow("+I", 104L, "Tomato", "Hongkong", "HONGKONG", LocalDateTime.parse("2020-08-16T00:05:05")),
-			changelogRow("+I", 105L, "Tim", "Shenzhen", "SHENZHEN", LocalDateTime.parse("2020-08-16T00:06"))
+			changelogRow("-U", 104L, "Tomato", "Hongkong", "HONGKONG", LocalDateTime.parse("2020-08-16T00:05:05")),
+			changelogRow("+U", 104L, "Tomato", "Shenzhen", "SHENZHEN", LocalDateTime.parse("2020-08-16T01:05:05")),
+			changelogRow("+I", 105L, "Tim", "Shenzhen", "SHENZHEN", LocalDateTime.parse("2020-08-16T00:06")),
+			changelogRow("-U", 105L, "Tim", "Shenzhen", "SHENZHEN", LocalDateTime.parse("2020-08-16T00:06")),
+			changelogRow("+U", 105L, "Tim", "Hongkong", "HONGKONG", LocalDateTime.parse("2020-08-16T01:06"))
 		);
 
 		// we ignore the orders for easier comparing, as we already verified ordering in testAggregate()
@@ -471,7 +487,6 @@ public class UpsertKafkaTableITCase extends KafkaTestBaseWithFlink {
 	}
 
 	private void temporalJoinUpsertKafka(String userTable) throws Exception {
-
 		// ------------- test data ---------------
 		List<Row> input = Arrays.asList(
 			Row.of(10001L, 100L, LocalDateTime.parse("2020-08-15T00:00:02")),
@@ -500,7 +515,7 @@ public class UpsertKafkaTableITCase extends KafkaTestBaseWithFlink {
 				null, null, null),
 
 			Row.of(10003L, 101L, LocalDateTime.parse("2020-08-16T00:04:06"),
-				"Alice", "HANGZHOU", LocalDateTime.parse("2020-08-16T00:04:05")),
+				"Alice", "WUHAN", LocalDateTime.parse("2020-08-16T00:02:00")),
 
 			Row.of(10004L, 104L, LocalDateTime.parse("2020-08-16T00:05:06"),
 				"Tomato", "HONGKONG", LocalDateTime.parse("2020-08-16T00:05:05"))

@@ -75,11 +75,31 @@ cdef class DataStreamFlatMapCoderImpl(BaseCoderImpl):
 
     def __init__(self, field_coder):
         self._single_field_coder = field_coder
+        self._end_message = <char*> malloc(1)
+        self._end_message[0] = 0x00
 
     cpdef void encode_to_stream(self, iter_value, LengthPrefixOutputStream output_stream):
         if iter_value:
             for value in iter_value:
                 self._single_field_coder.encode_to_stream(value, output_stream)
+        output_stream.write(self._end_message, 1)
+
+    cpdef object decode_from_stream(self, LengthPrefixInputStream input_stream):
+        return self._single_field_coder.decode_from_stream(input_stream)
+
+    def __dealloc__(self):
+        if self._end_message:
+            free(self._end_message)
+
+
+cdef class DataStreamCoFlatMapCoderImpl(BaseCoderImpl):
+
+    def __init__(self, field_coder):
+        self._single_field_coder = field_coder
+
+    cpdef void encode_to_stream(self, iter_value, LengthPrefixOutputStream output_stream):
+        for value in iter_value:
+            self._single_field_coder.encode_to_stream(value, output_stream)
 
     cpdef object decode_from_stream(self, LengthPrefixInputStream input_stream):
         return self._single_field_coder.decode_from_stream(input_stream)
@@ -414,6 +434,7 @@ cdef class FlattenRowCoderImpl(BaseCoderImpl):
         elif field_type == ROW:
             # Row
             row_field_coders = (<RowCoderImpl> field_coder).field_coders
+            row_field_names = (<RowCoderImpl> field_coder).field_names
             row_field_count = len(row_field_coders)
             mask = <bint*> malloc((row_field_count + ROW_KIND_BIT_SIZE) * sizeof(bint))
             leading_complete_bytes_num = (row_field_count + ROW_KIND_BIT_SIZE) // 8
@@ -425,6 +446,7 @@ cdef class FlattenRowCoderImpl(BaseCoderImpl):
                             row_field_coders[i].type_name(),
                             row_field_coders[i])
                         for i in range(row_field_count)])
+            row.set_field_names(row_field_names)
             row_kind_value = 0
             for i in range(ROW_KIND_BIT_SIZE):
                 row_kind_value += mask[i] * 2 ** i
@@ -858,8 +880,9 @@ cdef class MapCoderImpl(FieldCoder):
         return MAP
 
 cdef class RowCoderImpl(FieldCoder):
-    def __cinit__(self, field_coders):
+    def __cinit__(self, field_coders, field_names):
         self.field_coders = field_coders
+        self.field_names = field_names
 
     cpdef CoderType coder_type(self):
         return COMPLEX

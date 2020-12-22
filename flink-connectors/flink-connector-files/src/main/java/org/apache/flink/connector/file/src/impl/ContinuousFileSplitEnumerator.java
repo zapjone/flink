@@ -125,7 +125,11 @@ public class ContinuousFileSplitEnumerator implements SplitEnumerator<FileSource
 
 	@Override
 	public PendingSplitsCheckpoint<FileSourceSplit> snapshotState() throws Exception {
-		return PendingSplitsCheckpoint.fromCollectionSnapshot(splitAssigner.remainingSplits(), pathsAlreadyProcessed);
+		final PendingSplitsCheckpoint<FileSourceSplit> checkpoint =
+				PendingSplitsCheckpoint.fromCollectionSnapshot(splitAssigner.remainingSplits(), pathsAlreadyProcessed);
+
+		LOG.debug("Source Checkpoint is {}", checkpoint);
+		return checkpoint;
 	}
 
 	// ------------------------------------------------------------------------
@@ -149,6 +153,14 @@ public class ContinuousFileSplitEnumerator implements SplitEnumerator<FileSource
 
 		while (awaitingReader.hasNext()) {
 			final Map.Entry<Integer, String> nextAwaiting = awaitingReader.next();
+
+			// if the reader that requested another split has failed in the meantime, remove
+			// it from the list of waiting readers
+			if (!context.registeredReaders().containsKey(nextAwaiting.getKey())) {
+				awaitingReader.remove();
+				continue;
+			}
+
 			final String hostname = nextAwaiting.getValue();
 			final int awaitingSubtask = nextAwaiting.getKey();
 			final Optional<FileSourceSplit> nextSplit = splitAssigner.getNext(hostname);

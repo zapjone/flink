@@ -26,6 +26,7 @@ import org.apache.flink.table.api.TableColumn.ComputedColumn;
 import org.apache.flink.table.api.TableConfig;
 import org.apache.flink.table.api.TableSchema;
 import org.apache.flink.table.api.ValidationException;
+import org.apache.flink.table.api.config.TableConfigOptions;
 import org.apache.flink.table.api.constraints.UniqueConstraint;
 import org.apache.flink.table.api.internal.CatalogTableSchemaResolver;
 import org.apache.flink.table.catalog.Catalog;
@@ -56,6 +57,7 @@ import org.apache.flink.table.operations.ddl.AlterTablePropertiesOperation;
 import org.apache.flink.table.operations.ddl.AlterTableRenameOperation;
 import org.apache.flink.table.operations.ddl.CreateDatabaseOperation;
 import org.apache.flink.table.operations.ddl.CreateTableOperation;
+import org.apache.flink.table.operations.ddl.CreateViewOperation;
 import org.apache.flink.table.operations.ddl.DropDatabaseOperation;
 import org.apache.flink.table.planner.calcite.CalciteParser;
 import org.apache.flink.table.planner.calcite.FlinkPlannerImpl;
@@ -94,6 +96,7 @@ import static org.apache.flink.table.planner.utils.OperationMatchers.isCreateTab
 import static org.apache.flink.table.planner.utils.OperationMatchers.partitionedBy;
 import static org.apache.flink.table.planner.utils.OperationMatchers.withOptions;
 import static org.apache.flink.table.planner.utils.OperationMatchers.withSchema;
+import static org.hamcrest.CoreMatchers.instanceOf;
 import static org.hamcrest.CoreMatchers.is;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
@@ -1151,6 +1154,75 @@ public class SqlToOperationConverterTest {
 		thrown.expect(ValidationException.class);
 		thrown.expectMessage("CONSTRAINT [ct2] does not exist");
 		parse("alter table tb1 drop constraint ct2", SqlDialect.DEFAULT);
+	}
+
+	@Test
+	public void testCreateViewWithMatchRecognize() {
+		Map<String, String> prop = new HashMap<>();
+		prop.put("connector", "values");
+		prop.put("bounded", "true");
+		CatalogTableImpl catalogTable = new CatalogTableImpl(
+			TableSchema.builder()
+				.field("id", DataTypes.INT().notNull())
+				.field("measurement", DataTypes.BIGINT().notNull())
+				.field("ts", DataTypes.ROW(DataTypes.FIELD("tmstmp", DataTypes.TIMESTAMP(3))))
+				.build(),
+			prop,
+			null
+		);
+
+		catalogManager.createTable(
+			catalogTable,
+			ObjectIdentifier.of("builtin", "default", "events"),
+			false);
+
+		final String sql = ""
+			+ "CREATE TEMPORARY VIEW foo AS "
+			+ "SELECT * "
+			+ "FROM events MATCH_RECOGNIZE ("
+			+ "    PARTITION BY id "
+			+ "    ORDER BY ts ASC "
+			+ "    MEASURES "
+			+ "      next_step.measurement - this_step.measurement AS diff "
+			+ "    AFTER MATCH SKIP TO NEXT ROW "
+			+ "    PATTERN (this_step next_step)"
+			+ "    DEFINE "
+			+ "         this_step AS TRUE,"
+			+ "         next_step AS TRUE"
+			+ ")";
+
+		Operation operation = parse(sql, SqlDialect.DEFAULT);
+		assertThat(operation, instanceOf(CreateViewOperation.class));
+	}
+
+	@Test
+	public void testCreateViewWithDynamicTableOptions() {
+		tableConfig.getConfiguration().setBoolean(
+			TableConfigOptions.TABLE_DYNAMIC_TABLE_OPTIONS_ENABLED, true);
+		Map<String, String> prop = new HashMap<>();
+		prop.put("connector", "values");
+		prop.put("bounded", "true");
+		CatalogTableImpl catalogTable = new CatalogTableImpl(
+			TableSchema.builder()
+				.field("f0", DataTypes.INT())
+				.field("f1", DataTypes.VARCHAR(20))
+				.build(),
+			prop,
+			null
+		);
+
+		catalogManager.createTable(
+			catalogTable,
+			ObjectIdentifier.of("builtin", "default", "sourceA"),
+			false);
+
+		final String sql = ""
+			+ "create view test_view as\n"
+			+ "select *\n"
+			+ "from sourceA /*+ OPTIONS('changelog-mode'='I') */";
+
+		Operation operation = parse(sql, SqlDialect.DEFAULT);
+		assertThat(operation, instanceOf(CreateViewOperation.class));
 	}
 
 	//~ Tool Methods ----------------------------------------------------------

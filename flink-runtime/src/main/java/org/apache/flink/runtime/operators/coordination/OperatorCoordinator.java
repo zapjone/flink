@@ -47,6 +47,15 @@ import java.util.concurrent.CompletableFuture;
 public interface OperatorCoordinator extends CheckpointListener, AutoCloseable {
 
 	/**
+	 * The checkpoint ID passed to the restore methods when no completed checkpoint exists, yet.
+	 * It indicates that the restore is to the "initial state" of the coordinator or the
+	 * failed subtask.
+	 */
+	long NO_CHECKPOINT = -1L;
+
+	// ------------------------------------------------------------------------
+
+	/**
 	 * Starts the coordinator. This method is called once at the beginning, before any other methods.
 	 *
 	 * @throws Exception Any exception thrown from this method causes a full job failure.
@@ -72,14 +81,7 @@ public interface OperatorCoordinator extends CheckpointListener, AutoCloseable {
 	// ------------------------------------------------------------------------
 
 	/**
-	 * Called when one of the subtasks of the task running the coordinated operator failed.
-	 */
-	void subtaskFailed(int subtask, @Nullable Throwable reason);
-
-	// ------------------------------------------------------------------------
-
-	/**
-	 * Takes a checkpoint or the coordinator. The checkpoint is identified by the given ID.
+	 * Takes a checkpoint of the coordinator. The checkpoint is identified by the given ID.
 	 *
 	 * <p>To confirm the checkpoint and store state in it, the given {@code CompletableFuture}
 	 * must be completed with the state. To abort or dis-confirm the checkpoint, the given
@@ -123,9 +125,22 @@ public interface OperatorCoordinator extends CheckpointListener, AutoCloseable {
 	 * When this method is called, the coordinator can discard all other in-flight working state.
 	 * All subtasks will also have been reset to the same checkpoint.
 	 *
+	 * <p>This method is called in the case of a <i>global failover</i> of the system, which means
+	 * a failover of the coordinator (JobManager). This method is not invoked on a <i>partial
+	 * failover</i>; partial failovers call the {@link #subtaskReset(int, long)} method for the
+	 * involved subtasks.
+	 *
 	 * <p>This method is expected to behave synchronously with respect to other method calls and calls
 	 * to {@code Context} methods. For example, Events being sent by the Coordinator after this method
 	 * returns are assumed to take place after the checkpoint that was restored.
+	 *
+	 * <p>This method is called with a null state argument in the following situations:
+	 * <ul>
+	 *   <li>There is a recovery and there was no completed checkpoint yet.</li>
+	 *   <li>There is a recovery from a completed checkpoint/savepoint but it contained no state
+	 *       for the coordinator.</li>
+	 * </ul>
+	 * In both cases, the coordinator should reset to an empty (new) state.
 	 *
 	 * <h2>Restoring implicitly notifies of Checkpoint Completion</h2>
 	 *
@@ -137,7 +152,29 @@ public interface OperatorCoordinator extends CheckpointListener, AutoCloseable {
 	 * complete (for example when a system failure happened directly after committing the checkpoint,
 	 * before calling the {@link #notifyCheckpointComplete(long)} method).
 	 */
-	void resetToCheckpoint(byte[] checkpointData) throws Exception;
+	void resetToCheckpoint(long checkpointId, @Nullable byte[] checkpointData) throws Exception;
+
+	// ------------------------------------------------------------------------
+
+	/**
+	 * Called when one of the subtasks of the task running the coordinated operator goes
+	 * through a failover (failure / recovery cycle).
+	 *
+	 * <p>This method is called every time there is a failover of a subtasks, regardless of
+	 * whether there it is a partial failover or a global failover.
+	 */
+	void subtaskFailed(int subtask, @Nullable Throwable reason);
+
+	/**
+	 * Called if a task is recovered as part of a <i>partial failover</i>, meaning a failover
+	 * handled by the scheduler's failover strategy (by default recovering a pipelined region).
+	 * The method is invoked for each subtask involved in that partial failover.
+	 *
+	 * <p>In contrast to this method, the {@link #resetToCheckpoint(long, byte[])} method is called in
+	 * the case of a global failover, which is the case when the coordinator (JobManager) is
+	 * recovered.
+	 */
+	void subtaskReset(int subtask, long checkpointId);
 
 	// ------------------------------------------------------------------------
 	// ------------------------------------------------------------------------
@@ -175,6 +212,12 @@ public interface OperatorCoordinator extends CheckpointListener, AutoCloseable {
 		 * Gets the current parallelism with which this operator is executed.
 		 */
 		int currentParallelism();
+
+		/**
+		 * Gets the classloader that contains the additional dependencies, which are not
+		 * part of the JVM's classpath.
+		 */
+		ClassLoader getUserCodeClassloader();
 	}
 
 	// ------------------------------------------------------------------------
